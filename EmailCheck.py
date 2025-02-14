@@ -7,7 +7,27 @@ import argparse
 import json
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import logging
+from typing import List, Dict, Any
+from dataclasses import dataclass, field
 
+
+
+@dataclass
+class Config:
+    MAX_SPF_LOOKUPS: int = 10
+    VALID_DMARC_POLICIES: List[str] = field(default_factory=lambda: ['quarantine', 'reject'])
+    DEFAULT_THREADS: int = 5
+
+CONFIG = Config()
+
+# Configuração do logging
+def setup_logging(verbose: bool) -> None:
+    level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        level=level
+    )
 
 # Inicializa o colorama
 init(autoreset=True)
@@ -15,14 +35,14 @@ init(autoreset=True)
 def banner():
     print(Fore.GREEN +'''
             
-       ..--""|
-       |     |
-       | .---'
+       ..--"""|
+       | v0.9 |
+       | .----'
  (\-.--| |---------.
 / \) \ | |          \\
 |:.  | | |           |
 |:.  | |o|           |
-|:.  | `"`      2024 |
+|:.  | `"`      2025 |
 |:.  |_ __  __ _  __ /
 `""""`""|=`|"""""""`
         |=_|
@@ -30,7 +50,7 @@ def banner():
 ____    _  _ ____ _ _       ____ _  _ ____ ____ _  _ 
 |___ __ |\/| |__| | |       |    |__| |___ |    |_/  
 |___    |  | |  | | |___    |___ |  | |___ |___ | \_ 
-                                          ''', Fore.GREEN + '''@TheZakMan
+                                         ''', Fore.GREEN + '''@TheZakMan
 ____________________________________________________
             ''')
 
@@ -48,7 +68,7 @@ def initialize():
                                        help="Arquivo contendo uma lista de domínios a serem verificados")
     parser.add_argument("-o", "--output-json", type=str,
                         help="Arquivo para salvar a saída em formato JSON")
-    parser.add_argument("-t", "--threads", type=int, default=5,
+    parser.add_argument("-t", "--threads", type=int, default=CONFIG.DEFAULT_THREADS,
                         help="Número de threads para paralelizar as verificações")
     parser.add_argument("-v", "--verbose", action="store_true", default=None,
                         help="Habilita saída detalhada")
@@ -57,7 +77,12 @@ def initialize():
 
 
 def main(args):
+    setup_logging(args.verbose)
+    
     if not validate_args(args):
+        sys.exit(1)
+
+    if not check_dependencies():
         sys.exit(1)
 
     domains_list = []
@@ -67,9 +92,7 @@ def main(args):
         if args.verbose is None:
             args.verbose = True  # Por padrão, verbose é True para -d
     else:
-        with open(args.domains_file, "r") as domains_file:
-            domains_file_content = domains_file.readlines()
-            domains_list.extend(domains_file_content)
+        domains_list = read_domains_file(args.domains_file)
         if args.verbose is None:
             args.verbose = False  # Por padrão, verbose é False para -f
 
@@ -90,7 +113,7 @@ def cleanup_domains_list(domains_list):
 
 
 def validate_args(args):
-    domain_arg_valid = args.domain is None or validators.domain(args.domain)
+    domain_arg_valid = args.domain is None or validate_domain(args.domain)
     domain_file_arg_valid = args.domains_file is None or os.path.isfile(
         args.domains_file)
 
@@ -106,24 +129,60 @@ def validate_args(args):
     return valid_args
 
 
-def check_domain_security(domains, args):
-    if args.verbose or args.domain:
-        print_info(f"Analisando {len(domains)} domínio(s)...")
+def validate_domain(domain: str) -> bool:
+    """Valida um domínio com regras mais estritas."""
+    if not domain or len(domain) > 253:
+        return False
+        
+    if not validators.domain(domain):
+        return False
+        
+    return True
 
-    spoofable_domains = []
+
+def check_dependencies() -> bool:
+    """Verifica se todas as dependências necessárias estão instaladas."""
+    required = ['validators', 'checkdmarc', 'colorama']
+    try:
+        # Usando importlib ao invés de pkg_resources
+        import importlib
+        for package in required:
+            importlib.import_module(package)
+        return True
+    except ImportError as e:
+        print_error(f"Dependência faltando: {e.name}")
+        return False
+
+
+def check_domain_security(domains: List[str], args: argparse.Namespace) -> None:
+    from contextlib import contextmanager
+    
+    # Inicialização das listas de resultados
     results = []
-
-    with ThreadPoolExecutor(max_workers=args.threads) as executor:
-        future_to_domain = {executor.submit(analyze_domain, domain, args): domain for domain in domains}
-        for future in as_completed(future_to_domain):
-            domain = future_to_domain[future]
-            try:
-                result = future.result()
-                results.append(result)
-                if result.get('spoofing_possible'):
-                    spoofable_domains.append(domain)
-            except Exception as exc:
-                print_error(f"Ocorreu um erro ao analisar '{domain}': {exc}", fatal=False)
+    spoofable_domains = []
+    
+    @contextmanager
+    def executor_context(max_workers: int):
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            yield executor
+            
+    try:
+        with executor_context(args.threads) as executor:
+            future_to_domain = {
+                executor.submit(analyze_domain, domain, args): domain 
+                for domain in domains
+            }
+            for future in as_completed(future_to_domain):
+                domain = future_to_domain[future]
+                try:
+                    result = future.result()
+                    results.append(result)
+                    if result.get('spoofing_possible'):
+                        spoofable_domains.append(domain)
+                except Exception as exc:
+                    print_error(f"Ocorreu um erro ao analisar '{domain}': {exc}", fatal=False)
+    except Exception as e:
+        logging.error(f"Erro ao executar análise: {e}")
 
     # Relatório
     if spoofable_domains:
@@ -144,7 +203,17 @@ def check_domain_security(domains, args):
         print_info(f"Resultados salvos em {output_file}")
 
 
-def analyze_domain(domain, args):
+def analyze_domain(domain: str, args: argparse.Namespace) -> Dict[str, Any]:
+    """
+    Analisa a segurança de email de um domínio.
+    
+    Args:
+        domain: O domínio a ser analisado
+        args: Argumentos da linha de comando
+        
+    Returns:
+        Dict contendo os resultados da análise
+    """
     result = {'domain': domain, 'issues': [], 'spoofing_possible': False}
     verbose = args.verbose
 
@@ -180,7 +249,7 @@ def analyze_domain(domain, args):
                 print_warning(
                     f"SPF 'all' mechanism não está definido como 'fail' ou 'softfail' para '{domain}'")
 
-        if spf_dns_lookups > 10:
+        if spf_dns_lookups > CONFIG.MAX_SPF_LOOKUPS:
             result['issues'].append(f"SPF record requer muitas consultas DNS ({spf_dns_lookups})")
             if verbose:
                 print_warning(
@@ -225,7 +294,7 @@ def analyze_domain(domain, args):
             if verbose:
                 print_warning(
                     f"DMARC policy está definido como 'none' (sem enforcement) para '{domain}'")
-        elif dmarc_policy in ['quarantine', 'reject']:
+        elif dmarc_policy in CONFIG.VALID_DMARC_POLICIES:
             if verbose:
                 print_info(
                     f"DMARC policy está definido como '{dmarc_policy}' para '{domain}'")
@@ -349,6 +418,30 @@ def print_warning(message):
 
 def print_info(message):
     print(Fore.LIGHTBLUE_EX + Style.BRIGHT + f"[+] INFO: {message}")
+
+
+def format_results(results: List[Dict[str, Any]], timestamp: str) -> Dict[str, Any]:
+    """Formata os resultados para JSON."""
+    return {
+        "scan_timestamp": timestamp,
+        "total_domains": len(results),
+        "vulnerable_domains": sum(1 for r in results if r.get('spoofing_possible')),
+        "results": results,
+        "metadata": {
+            "tool_version": "1.0.0",
+            "scan_date": datetime.now().isoformat()
+        }
+    }
+
+
+def read_domains_file(file_path: str) -> List[str]:
+    """Lê domínios de um arquivo de forma segura."""
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            return [line.strip().lower() for line in f if line.strip()]
+    except Exception as e:
+        logging.error(f"Erro ao ler arquivo de domínios: {e}")
+        return []
 
 
 if __name__ == "__main__":
