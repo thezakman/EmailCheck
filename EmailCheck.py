@@ -72,6 +72,8 @@ def initialize():
                         help="Número de threads para paralelizar as verificações")
     parser.add_argument("-v", "--verbose", action="store_true", default=None,
                         help="Habilita saída detalhada")
+    parser.add_argument("-r", "--report", action="store_true",
+                        help="Gera um relatório detalhado da análise")
     args = parser.parse_args()
     main(args)
 
@@ -184,7 +186,13 @@ def check_domain_security(domains: List[str], args: argparse.Namespace) -> None:
     except Exception as e:
         logging.error(f"Erro ao executar análise: {e}")
 
-    # Relatório
+    # Gerar e exibir o resumo apenas se --report for especificado
+    if results and args.report:
+        print("\n" + "="*50)
+        print(generate_report_summary(results))
+        print("="*50 + "\n")
+
+    # Relatório de domínios vulneráveis sempre será mostrado
     if spoofable_domains:
         print(Fore.CYAN + Style.BRIGHT +
               f"\nSpoofing possível para {len(spoofable_domains)} domínio(s):")
@@ -442,6 +450,32 @@ def read_domains_file(file_path: str) -> List[str]:
     except Exception as e:
         logging.error(f"Erro ao ler arquivo de domínios: {e}")
         return []
+
+
+def generate_report_summary(results: List[Dict[str, Any]]) -> str:
+    """Gera um resumo detalhado dos resultados."""
+    total_domains = len(results)
+    vulnerable_domains = sum(1 for r in results if r.get('spoofing_possible'))
+    
+    summary = f"""
+📊 Resumo da Análise
+===================
+Total de domínios analisados: {total_domains}
+Domínios vulneráveis: {vulnerable_domains}
+Taxa de vulnerabilidade: {(vulnerable_domains/total_domains)*100:.1f}%
+
+🔍 Principais Problemas Encontrados:
+"""
+    # Agregação de problemas comuns
+    issues_count = {}
+    for result in results:
+        for issue in result['issues']:
+            issues_count[issue] = issues_count.get(issue, 0) + 1
+            
+    for issue, count in sorted(issues_count.items(), key=lambda x: x[1], reverse=True):
+        summary += f"- {issue}: {count} ocorrência(s)\n"
+        
+    return summary
 
 
 if __name__ == "__main__":
